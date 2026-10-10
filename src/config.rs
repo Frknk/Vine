@@ -189,7 +189,7 @@ pub struct MotdConfig {
     pub max_players: u32,
     /// Custom version display string (e.g. "Vine 1.7.x - 26.x")
     pub version_name: String,
-    /// Protocol version reported to clients (776 is 26.2)
+    /// Protocol version reported to clients (777 is 26.3)
     pub protocol_version: i32,
     /// Optional sample player list shown on hover in server list
     pub sample_players: Vec<String>,
@@ -358,7 +358,7 @@ impl Default for Config {
                 line2: "§7Multi-version support §8• §e1.7.x - 26.x".to_string(),
                 max_players: 100,
                 version_name: "Vine 1.7.x - 26.x".to_string(),
-                protocol_version: 776,
+                protocol_version: 777,
                 sample_players: vec![
                     "§aVine Multi-Version Proxy".to_string(),
                     "§7Secure • Fast • Reliable".to_string(),

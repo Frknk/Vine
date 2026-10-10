@@ -105,7 +105,7 @@ impl ClientHandler {
             .map_err(|_| ClientError::Timeout)?
             .map_err(|e| ClientError::DecodeError(e.to_string()))?;
 
-        let client_version_guess = JavaMinecraftVersion::V_26_2;
+        let client_version_guess = JavaMinecraftVersion::V_26_3;
         let mut handshake_bytes = &raw_handshake.payload[..];
         let handshake = SHandShake::read(&mut handshake_bytes, &client_version_guess)
             .map_err(|e| ClientError::DecodeError(e.to_string()))?;

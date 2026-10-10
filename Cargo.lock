@@ -63,9 +63,9 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "async-compression"
-version = "0.4.46"
+version = "0.4.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f10dafd0c8d2e51ae9a748805777613ed0bbe17bf586b76c8311f45c020a32f"
+checksum = "ee19bd99b43e3691acbad4e840420a4881cea6c0b66a208125a824f8fd53f5a1"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -316,9 +316,9 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.41"
+version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58a6d0db8759036a783bc7c3f7a07f8cef3bf9470eb1db3bc86e8bcd1c5d0fe8"
+checksum = "98fc98460ba0ad5317075d3632b8dfc45d0be8c4a49347c2a38272019717614a"
 dependencies = [
  "compression-core",
  "flate2",
@@ -1931,7 +1931,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-auth"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "base64 0.23.1",
  "crypto-bigint",
@@ -1951,7 +1952,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-codecs"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "serde_json",
  "tracing",
@@ -1959,7 +1961,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-command"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "pumpkin-codecs",
  "pumpkin-data",
@@ -1974,7 +1977,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-data"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "crc-fast",
  "phf",
@@ -1986,7 +1990,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-macros"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "heck",
  "proc-macro-error2",
@@ -1997,7 +2002,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-nbt"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "bytes",
  "cesu8",
@@ -2010,7 +2016,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-plugin-runtime"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "futures",
  "thiserror 2.0.20",
@@ -2021,7 +2028,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-protocol"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "aes",
  "async-compression",
@@ -2045,7 +2053,8 @@ dependencies = [
 
 [[package]]
 name = "pumpkin-util"
-version = "0.1.0+26.2-26.45"
+version = "0.2.0+26.3-26.51"
+source = "git+https://github.com/Pumpkin-MC/Pumpkin?rev=204a94ed895f041a845630d5a23c094705a0704e#204a94ed895f041a845630d5a23c094705a0704e"
 dependencies = [
  "bytes",
  "colored",
