@@ -1573,6 +1573,18 @@ impl BackendBridge {
             exit = client_writer => exit,
         };
 
+        // Packets still queued for the client when the tunnel ends go out first, in order: a
+        // backend's chat line right before its transfer, or the proxy's own "Connecting you to"
+        // reply before a switch, would otherwise be lost with the writer.
+        if !matches!(exit, TunnelExit::ClientDisconnected) {
+            while let Ok(bytes) = client_rx.try_recv() {
+                if client_encoder.write_packet(bytes).await.is_err() {
+                    break;
+                }
+            }
+            let _ = client_encoder.flush().await;
+        }
+
         Ok(exit)
     }
 }
