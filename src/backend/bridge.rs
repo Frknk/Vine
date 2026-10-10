@@ -16,9 +16,11 @@ use pumpkin_protocol::java::client::play::{
 use pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder;
 use pumpkin_protocol::java::packet_encoder::TCPNetworkEncoder;
 use pumpkin_protocol::java::server::handshake::SHandShake;
-use pumpkin_protocol::java::server::login::{SLoginPluginResponse, SLoginStart};
+use pumpkin_protocol::java::server::login::{
+    SLoginAcknowledged, SLoginPluginResponse, SLoginStart,
+};
 use pumpkin_protocol::java::server::play::{
-    SChatCommand, SChatMessage, SCommandSuggestion, SCustomPayload,
+    SChatCommand, SChatMessage, SCommandSuggestion, SConfigurationAcknowledged, SCustomPayload,
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt};
@@ -624,13 +626,20 @@ impl BackendBridge {
                     };
 
                     match self.login_backend(&server_name, &target_config).await {
-                        Ok((new_dec, new_enc, _)) => {
-                            if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                && let Ok(bytes) =
-                                    CStartConfiguration.serialize_packet(&self.client_version)
+                        Ok((new_dec, mut new_enc, _)) => {
+                            if let Err(e) = self
+                                .reconfigure_client(
+                                    &mut client_decoder,
+                                    &mut client_encoder,
+                                    &mut new_enc,
+                                )
+                                .await
                             {
-                                let _ = client_encoder.write_packet(bytes).await;
-                                let _ = client_encoder.flush().await;
+                                warn!(
+                                    "Player '{}' did not re-enter configuration for '{}': {}",
+                                    self.player.username, server_name, e
+                                );
+                                break;
                             }
                             backend_decoder = new_dec;
                             backend_encoder = new_enc;
@@ -673,13 +682,20 @@ impl BackendBridge {
                             if can_fallback {
                                 let (fb_name, fb_cfg) = self.fallback_server.as_ref().unwrap();
                                 match self.login_backend(fb_name, fb_cfg).await {
-                                    Ok((new_dec, new_enc, _)) => {
-                                        if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                            && let Ok(bytes) = CStartConfiguration
-                                                .serialize_packet(&self.client_version)
+                                    Ok((new_dec, mut new_enc, _)) => {
+                                        if let Err(e) = self
+                                            .reconfigure_client(
+                                                &mut client_decoder,
+                                                &mut client_encoder,
+                                                &mut new_enc,
+                                            )
+                                            .await
                                         {
-                                            let _ = client_encoder.write_packet(bytes).await;
-                                            let _ = client_encoder.flush().await;
+                                            warn!(
+                                                "Player '{}' did not re-enter configuration for '{}': {}",
+                                                self.player.username, fb_name, e
+                                            );
+                                            break;
                                         }
                                         backend_decoder = new_dec;
                                         backend_encoder = new_enc;
@@ -740,13 +756,20 @@ impl BackendBridge {
                         }
 
                         match self.login_backend(fb_name, fb_cfg).await {
-                            Ok((new_dec, new_enc, _)) => {
-                                if self.client_version >= JavaMinecraftVersion::V_1_20_2
-                                    && let Ok(bytes) =
-                                        CStartConfiguration.serialize_packet(&self.client_version)
+                            Ok((new_dec, mut new_enc, _)) => {
+                                if let Err(e) = self
+                                    .reconfigure_client(
+                                        &mut client_decoder,
+                                        &mut client_encoder,
+                                        &mut new_enc,
+                                    )
+                                    .await
                                 {
-                                    let _ = client_encoder.write_packet(bytes).await;
-                                    let _ = client_encoder.flush().await;
+                                    warn!(
+                                        "Player '{}' did not re-enter configuration for '{}': {}",
+                                        self.player.username, fb_name, e
+                                    );
+                                    break;
                                 }
                                 backend_decoder = new_dec;
                                 backend_encoder = new_enc;
@@ -809,6 +832,73 @@ impl BackendBridge {
             self.online_players.load(Ordering::Relaxed)
         );
 
+        Ok(())
+    }
+
+    /// Hands a 1.20.2+ client in play over to a backend that has just sent login success.
+    ///
+    /// The client goes back to configuration with `CStartConfiguration` and answers with the
+    /// play-state `SConfigurationAcknowledged`; only then is the new backend, still in the login
+    /// state, sent `SLoginAcknowledged`, so both sides enter configuration together. Play
+    /// packets the client sends in between were meant for the old backend and are dropped.
+    /// Older clients have no configuration state and are left as they are.
+    async fn reconfigure_client<R1, W1, W2>(
+        &self,
+        client_decoder: &mut TCPNetworkDecoder<R1>,
+        client_encoder: &mut TCPNetworkEncoder<W1>,
+        backend_encoder: &mut TCPNetworkEncoder<W2>,
+    ) -> Result<(), BridgeError>
+    where
+        R1: AsyncRead + Unpin,
+        W1: AsyncWrite + Unpin,
+        W2: AsyncWrite + Unpin,
+    {
+        let version = self.client_version;
+        if version < JavaMinecraftVersion::V_1_20_2 {
+            return Ok(());
+        }
+
+        let start = CStartConfiguration
+            .serialize_packet(&version)
+            .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+        client_encoder
+            .write_packet(start)
+            .await
+            .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+        client_encoder
+            .flush()
+            .await
+            .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+
+        let acknowledged_id = SConfigurationAcknowledged::to_id(version);
+        let wait = Duration::from_secs(self.network_config.backend_login_timeout_secs);
+        timeout(wait, async {
+            loop {
+                let raw_packet = client_decoder
+                    .get_raw_packet()
+                    .await
+                    .map_err(|e| BridgeError::DecodeError(e.to_string()))?;
+                if raw_packet.id == acknowledged_id {
+                    return Ok::<(), BridgeError>(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            BridgeError::DecodeError("configuration acknowledgement timed out".into())
+        })??;
+
+        let acknowledged = SLoginAcknowledged
+            .serialize_packet(&version)
+            .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+        backend_encoder
+            .write_packet(acknowledged)
+            .await
+            .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
+        backend_encoder
+            .flush()
+            .await
+            .map_err(|e| BridgeError::EncodeError(e.to_string()))?;
         Ok(())
     }
 
