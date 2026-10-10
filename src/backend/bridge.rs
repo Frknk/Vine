@@ -887,6 +887,42 @@ fn decode_backend_suggestions(
     }
 }
 
+/// Reads the host and port of a clientbound transfer packet's payload.
+fn decode_transfer(payload: &[u8]) -> Option<(String, u16)> {
+    let mut cur = payload;
+    let host = cur.get_str().ok()?.to_string();
+    let port = u16::try_from(cur.get_var_int().ok()?.0).ok()?;
+    Some((host, port))
+}
+
+/// Finds the configured backend whose address is `host:port`, ignoring host case and treating
+/// `localhost` and `::1` as `127.0.0.1`.
+fn backend_for_transfer<'a>(
+    servers: &'a std::collections::HashMap<String, BackendConfig>,
+    host: &str,
+    port: u16,
+) -> Option<&'a str> {
+    fn normalize(host: &str) -> String {
+        let host = host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        match host.as_str() {
+            "localhost" | "::1" => "127.0.0.1".to_string(),
+            _ => host,
+        }
+    }
+
+    let target = normalize(host);
+    servers.iter().find_map(|(name, backend)| {
+        let (backend_host, backend_port) = backend.address.rsplit_once(':')?;
+        let backend_port: u16 = backend_port.trim().parse().ok()?;
+        (backend_port == port && normalize(backend_host) == target).then_some(name.as_str())
+    })
+}
+
 fn inject_proxy_commands(
     payload: &[u8],
     client_version: &JavaMinecraftVersion,
@@ -1040,6 +1076,12 @@ impl BackendBridge {
         let command_suggestions_clientbound_id = CCommandSuggestions::to_id(client_version);
         let commands_packet_id = CCommands::to_id(client_version);
         let play_disconnect_id = CPlayDisconnect::to_id(client_version);
+        // The transfer packet exists since 1.20.5; packet ids are never negative.
+        let transfer_id = if client_version >= JavaMinecraftVersion::V_1_20_5 {
+            CTransfer::to_id(client_version)
+        } else {
+            -1
+        };
 
         let pending_suggestions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<i32, PendingSuggestion>>,
@@ -1285,6 +1327,29 @@ impl BackendBridge {
                                     if s.is_empty() { None } else { Some(s) }
                                 });
                             return TunnelExit::BackendDisconnected { reason };
+                        }
+
+                        // A backend transferring the player to another configured backend
+                        // would send the client around the proxy, so switch it here instead.
+                        if raw_packet.id == transfer_id
+                            && let Some((host, port)) = decode_transfer(&raw_packet.payload)
+                            && let Some(server_name) =
+                                backend_for_transfer(&proxy_config.servers, &host, port)
+                        {
+                            if server_name == current_server_name {
+                                debug!(
+                                    "Dropping transfer of '{}' to its current backend '{}'",
+                                    username, server_name
+                                );
+                                continue;
+                            }
+                            info!(
+                                "Backend '{}' transferred '{}' to {}:{}; switching to '{}' through the proxy",
+                                current_server_name, username, host, port, server_name
+                            );
+                            return TunnelExit::Connect {
+                                server_name: server_name.to_string(),
+                            };
                         }
 
                         if raw_packet.id == command_suggestions_clientbound_id {
@@ -1566,5 +1631,59 @@ mod tests {
 
         // The packet must end with VarInt(0) for root_node_index
         assert_eq!(injected.last(), Some(&0));
+    }
+
+    fn backend(address: &str) -> BackendConfig {
+        BackendConfig {
+            address: address.to_string(),
+            forwarding: ForwardingMode::Velocity,
+            secret: None,
+            icon_path: None,
+            motd_line1: None,
+            motd_line2: None,
+        }
+    }
+
+    #[test]
+    fn test_decode_transfer() {
+        let version = JavaMinecraftVersion::V_26_3;
+        let bytes = CTransfer::new("127.0.0.1", VarInt(25567))
+            .serialize_packet(&version)
+            .expect("serialize transfer");
+        let mut slice = &bytes[..];
+        let pkt_id = slice.get_var_int().expect("read pkt id");
+        assert_eq!(pkt_id.0, CTransfer::to_id(version));
+
+        assert_eq!(
+            decode_transfer(slice),
+            Some(("127.0.0.1".to_string(), 25567))
+        );
+        assert_eq!(decode_transfer(&[]), None);
+    }
+
+    #[test]
+    fn test_backend_for_transfer() {
+        let servers = std::collections::HashMap::from([
+            ("hub".to_string(), backend("127.0.0.1:25566")),
+            ("fullpvp".to_string(), backend("127.0.0.1:25567")),
+            ("remote".to_string(), backend("Play.Example.com:25565")),
+        ]);
+
+        assert_eq!(
+            backend_for_transfer(&servers, "127.0.0.1", 25567),
+            Some("fullpvp")
+        );
+        assert_eq!(
+            backend_for_transfer(&servers, "localhost", 25566),
+            Some("hub")
+        );
+        assert_eq!(backend_for_transfer(&servers, "[::1]", 25566), Some("hub"));
+        assert_eq!(
+            backend_for_transfer(&servers, "play.example.com", 25565),
+            Some("remote")
+        );
+        // Another port (the proxy itself) or an unknown host is a real transfer.
+        assert_eq!(backend_for_transfer(&servers, "127.0.0.1", 25565), None);
+        assert_eq!(backend_for_transfer(&servers, "10.0.0.5", 25567), None);
     }
 }
