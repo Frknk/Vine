@@ -24,13 +24,14 @@ use pumpkin_protocol::java::server::play::{
 };
 use pumpkin_protocol::packet::MultiVersionJavaPacket;
 use pumpkin_protocol::ser::{NetworkReadExt, NetworkReadSliceExt};
-use pumpkin_protocol::{ClientPacket, ConnectionState, ServerPacket};
+use pumpkin_protocol::{ClientPacket, ConnectionState, PacketDecodeError, RawPacket, ServerPacket};
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::JavaMinecraftVersion;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -67,6 +68,53 @@ pub enum BridgeError {
     VelocityError(String),
     #[error("Vine forwarding error: {0}")]
     VineError(String),
+}
+
+/// The client's packets, whole and in order, as read by [`spawn_client_reader`].
+type ClientPackets = tokio::sync::mpsc::Receiver<Result<RawPacket, PacketDecodeError>>;
+
+/// Client packets read ahead of the tunnel. Bounded, so a slow backend still pushes back on the
+/// client's TCP stream.
+const CLIENT_READ_QUEUE: usize = 128;
+
+/// Reads the client's packets on a task of their own for the rest of the session.
+///
+/// `get_raw_packet` is not cancel-safe: a read dropped halfway through a frame loses those bytes
+/// and every later frame is misread. The tunnel's `select!` drops its branches whenever a backend
+/// switch starts, so the reads happen here and the tunnel takes whole packets from a channel,
+/// whose `recv` is cancel-safe.
+fn spawn_client_reader<R>(mut decoder: TCPNetworkDecoder<R>) -> (ClientPackets, JoinHandle<()>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(CLIENT_READ_QUEUE);
+    let reader = tokio::spawn(async move {
+        loop {
+            let packet = decoder.get_raw_packet().await;
+            let failed = packet.is_err();
+            if tx.send(packet).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    (rx, reader)
+}
+
+/// The next client packet. A reader that has stopped reads as a closed connection.
+async fn next_client_packet(packets: &mut ClientPackets) -> Result<RawPacket, PacketDecodeError> {
+    packets
+        .recv()
+        .await
+        .unwrap_or(Err(PacketDecodeError::ConnectionClosed))
+}
+
+/// Stops the client reader when the session ends, however it ends.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Debug)]
@@ -411,7 +459,7 @@ impl BackendBridge {
     /// Establishes connection to backend, handles login handshake, and tunnels packets
     pub async fn run<R, W>(
         self,
-        mut client_decoder: TCPNetworkDecoder<R>,
+        client_decoder: TCPNetworkDecoder<R>,
         mut client_encoder: TCPNetworkEncoder<W>,
     ) -> Result<(), BridgeError>
     where
@@ -524,10 +572,15 @@ impl BackendBridge {
             protocol_version: self.client_version.protocol_version() as u32,
         });
 
+        // From here on the client is read on a task of its own, so a backend switch never cuts a
+        // read short.
+        let (mut client_packets, client_reader) = spawn_client_reader(client_decoder);
+        let _client_reader = AbortOnDrop(client_reader);
+
         loop {
             let tunnel_res = Self::bridge_tunnel(
                 &self.player.username,
-                &mut client_decoder,
+                &mut client_packets,
                 &mut client_encoder,
                 &mut backend_decoder,
                 &mut backend_encoder,
@@ -629,7 +682,7 @@ impl BackendBridge {
                         Ok((new_dec, mut new_enc, _)) => {
                             if let Err(e) = self
                                 .reconfigure_client(
-                                    &mut client_decoder,
+                                    &mut client_packets,
                                     &mut client_encoder,
                                     &mut new_enc,
                                 )
@@ -685,7 +738,7 @@ impl BackendBridge {
                                     Ok((new_dec, mut new_enc, _)) => {
                                         if let Err(e) = self
                                             .reconfigure_client(
-                                                &mut client_decoder,
+                                                &mut client_packets,
                                                 &mut client_encoder,
                                                 &mut new_enc,
                                             )
@@ -759,7 +812,7 @@ impl BackendBridge {
                             Ok((new_dec, mut new_enc, _)) => {
                                 if let Err(e) = self
                                     .reconfigure_client(
-                                        &mut client_decoder,
+                                        &mut client_packets,
                                         &mut client_encoder,
                                         &mut new_enc,
                                     )
@@ -842,14 +895,13 @@ impl BackendBridge {
     /// state, sent `SLoginAcknowledged`, so both sides enter configuration together. Play
     /// packets the client sends in between were meant for the old backend and are dropped.
     /// Older clients have no configuration state and are left as they are.
-    async fn reconfigure_client<R1, W1, W2>(
+    async fn reconfigure_client<W1, W2>(
         &self,
-        client_decoder: &mut TCPNetworkDecoder<R1>,
+        client_packets: &mut ClientPackets,
         client_encoder: &mut TCPNetworkEncoder<W1>,
         backend_encoder: &mut TCPNetworkEncoder<W2>,
     ) -> Result<(), BridgeError>
     where
-        R1: AsyncRead + Unpin,
         W1: AsyncWrite + Unpin,
         W2: AsyncWrite + Unpin,
     {
@@ -874,8 +926,7 @@ impl BackendBridge {
         let wait = Duration::from_secs(self.network_config.backend_login_timeout_secs);
         timeout(wait, async {
             loop {
-                let raw_packet = client_decoder
-                    .get_raw_packet()
+                let raw_packet = next_client_packet(client_packets)
                     .await
                     .map_err(|e| BridgeError::DecodeError(e.to_string()))?;
                 if raw_packet.id == acknowledged_id {
@@ -1135,9 +1186,9 @@ fn inject_proxy_commands(
 impl BackendBridge {
     /// Tunnels packets back and forth between client and backend
     #[allow(clippy::too_many_arguments)]
-    async fn bridge_tunnel<R1, W1, R2, W2>(
+    async fn bridge_tunnel<W1, R2, W2>(
         username: &str,
-        client_decoder: &mut TCPNetworkDecoder<R1>,
+        client_packets: &mut ClientPackets,
         client_encoder: &mut TCPNetworkEncoder<W1>,
         backend_decoder: &mut TCPNetworkDecoder<R2>,
         backend_encoder: &mut TCPNetworkEncoder<W2>,
@@ -1153,7 +1204,6 @@ impl BackendBridge {
         current_server_name: String,
     ) -> Result<TunnelExit, BridgeError>
     where
-        R1: AsyncRead + Unpin,
         W1: AsyncWrite + Unpin,
         R2: AsyncRead + Unpin,
         W2: AsyncWrite + Unpin,
@@ -1179,23 +1229,34 @@ impl BackendBridge {
 
         let (client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
 
+        // Writing a packet is not cancel-safe either: a write dropped halfway leaves a cut frame
+        // on the client's stream, and the client misreads everything after it, starting with
+        // the `CStartConfiguration` of a switch. So the writer is never dropped while the tunnel
+        // is still going: once another branch ends it, `stop_writer` tells it to send what is
+        // queued, in order, and return. It returns false when the client can't be written to.
+        let stop_writer = tokio::sync::Notify::new();
         let client_writer = async {
-            while let Some(packet_bytes) = client_rx.recv().await {
+            loop {
+                let packet_bytes = tokio::select! {
+                    biased;
+                    Some(packet_bytes) = client_rx.recv() => packet_bytes,
+                    () = stop_writer.notified() => return true,
+                };
                 if let Err(e) = client_encoder.write_packet(packet_bytes).await {
                     debug!("Client write failed for '{}': {:?}", username, e);
-                    return TunnelExit::ClientDisconnected;
+                    return false;
                 }
                 if let Err(e) = client_encoder.flush().await {
                     debug!("Client flush failed for '{}': {:?}", username, e);
-                    return TunnelExit::ClientDisconnected;
+                    return false;
                 }
             }
-            TunnelExit::ClientDisconnected
         };
+        tokio::pin!(client_writer);
 
         let client_to_backend = async {
             loop {
-                match client_decoder.get_raw_packet().await {
+                match next_client_packet(client_packets).await {
                     Ok(raw_packet) => {
                         if !client_rate_limiter.record_packet() {
                             warn!(
@@ -1566,25 +1627,30 @@ impl BackendBridge {
             TunnelExit::ClientDisconnected
         };
 
+        let mut writer_done = false;
         let exit = tokio::select! {
             exit = client_to_backend => exit,
             exit = backend_to_client => exit,
             exit = action_loop => exit,
-            exit = client_writer => exit,
+            _ = &mut client_writer => {
+                writer_done = true;
+                TunnelExit::ClientDisconnected
+            }
         };
 
-        // Packets still queued for the client when the tunnel ends go out first, in order: a
+        // The writer finishes the packet it is on, then sends what is still queued, in order: a
         // backend's chat line right before its transfer, or the proxy's own "Connecting you to"
-        // reply before a switch, would otherwise be lost with the writer.
-        if !matches!(exit, TunnelExit::ClientDisconnected) {
-            while let Ok(bytes) = client_rx.try_recv() {
-                if client_encoder.write_packet(bytes).await.is_err() {
-                    break;
-                }
-            }
-            let _ = client_encoder.flush().await;
+        // reply before a switch, would otherwise be lost.
+        if writer_done || matches!(exit, TunnelExit::ClientDisconnected) {
+            return Ok(exit);
         }
-
+        // A client that stops reading would hold the switch forever; give it as long as a backend
+        // login gets, then end the session (its stream is mid-packet by then).
+        stop_writer.notify_one();
+        let wait = Duration::from_secs(proxy_config.network.backend_login_timeout_secs);
+        if !matches!(timeout(wait, client_writer).await, Ok(true)) {
+            return Ok(TunnelExit::ClientDisconnected);
+        }
         Ok(exit)
     }
 }
@@ -1787,5 +1853,142 @@ mod tests {
         // Another port (the proxy itself) or an unknown host is a real transfer.
         assert_eq!(backend_for_transfer(&servers, "127.0.0.1", 25565), None);
         assert_eq!(backend_for_transfer(&servers, "10.0.0.5", 25567), None);
+    }
+
+    /// A switch that starts while a large packet is still being written to a slow client must
+    /// not cut that packet: the client reads it whole and then reads the `CStartConfiguration`
+    /// that follows cleanly. A client packet half-read when the switch starts arrives whole.
+    #[tokio::test]
+    async fn test_switch_keeps_client_frames_whole() {
+        use tokio::io::AsyncWriteExt;
+
+        let version = JavaMinecraftVersion::V_26_3;
+        let chat_id = CSystemChatMessage::to_id(version);
+
+        // Proxy to client through a 1 KiB pipe, so a 64 KiB packet stops halfway.
+        let (to_client_w, to_client_r) = tokio::io::duplex(1024);
+        let mut client_encoder = TCPNetworkEncoder::new(to_client_w);
+        let (mut from_client_w, from_client_r) = tokio::io::duplex(64 * 1024);
+        let (mut client_packets, reader) =
+            spawn_client_reader(TCPNetworkDecoder::new(from_client_r));
+        let _reader = AbortOnDrop(reader);
+        let (backend_w, backend_r) = tokio::io::duplex(256 * 1024);
+        let mut backend_decoder = TCPNetworkDecoder::new(backend_r);
+        let (to_backend_w, _to_backend_r) = tokio::io::duplex(64 * 1024);
+        let mut backend_encoder = TCPNetworkEncoder::new(to_backend_w);
+
+        // The backend sends a large packet, then transfers the player to another backend.
+        let mut big = Vec::new();
+        VarInt(chat_id).encode(&mut big).expect("encode id");
+        big.extend(std::iter::repeat_n(7u8, 64 * 1024));
+        let mut backend_side = TCPNetworkEncoder::new(backend_w);
+        backend_side
+            .write_packet(big.into())
+            .await
+            .expect("write big");
+        let transfer = CTransfer::new("127.0.0.1", VarInt(25567))
+            .serialize_packet(&version)
+            .expect("serialize transfer");
+        backend_side
+            .write_packet(transfer)
+            .await
+            .expect("write transfer");
+        backend_side.flush().await.expect("flush backend");
+
+        // Half of a client frame: length, id, and 50 of its 100 payload bytes.
+        let mut client_payload = Vec::new();
+        VarInt(0x10).encode(&mut client_payload).expect("encode id");
+        client_payload.extend([1u8; 100]);
+        let mut client_frame = Vec::new();
+        VarInt(client_payload.len() as i32)
+            .encode(&mut client_frame)
+            .expect("encode length");
+        client_frame.extend(&client_payload);
+        let half = client_frame.len() - 50;
+        from_client_w
+            .write_all(&client_frame[..half])
+            .await
+            .expect("write half");
+
+        // The client starts reading only once the switch has begun.
+        let client = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut decoder = TCPNetworkDecoder::new(to_client_r);
+            let first = decoder.get_raw_packet().await.expect("large packet");
+            let second = decoder.get_raw_packet().await.expect("start configuration");
+            (first, second)
+        });
+
+        let config = Config {
+            servers: std::collections::HashMap::from([
+                ("hub".to_string(), backend("127.0.0.1:25566")),
+                ("fullpvp".to_string(), backend("127.0.0.1:25567")),
+            ]),
+            ..Config::default()
+        };
+        let plugins_dir = tempfile::tempdir().expect("temp dir");
+        let plugin_manager =
+            PluginManager::new(plugins_dir.path().to_path_buf()).expect("plugin manager");
+        let (action_tx, mut action_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let exit = timeout(
+            Duration::from_secs(5),
+            BackendBridge::bridge_tunnel(
+                "Frknk",
+                &mut client_packets,
+                &mut client_encoder,
+                &mut backend_decoder,
+                &mut backend_encoder,
+                1000,
+                version,
+                &mut action_rx,
+                &action_tx,
+                Arc::new(CommandDispatcher::new()),
+                Arc::new(config),
+                Arc::new(SessionManager::new()),
+                plugin_manager,
+                uuid::Uuid::nil(),
+                "hub".to_string(),
+            ),
+        )
+        .await
+        .expect("tunnel ends")
+        .expect("tunnel result");
+        assert!(
+            matches!(&exit, TunnelExit::Connect { server_name } if server_name == "fullpvp"),
+            "unexpected exit {exit:?}"
+        );
+
+        // What `run` sends next when it switches.
+        let start = CStartConfiguration
+            .serialize_packet(&version)
+            .expect("serialize start");
+        client_encoder
+            .write_packet(start)
+            .await
+            .expect("write start");
+        client_encoder.flush().await.expect("flush start");
+
+        let (first, second) = timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client reads both frames")
+            .expect("client task");
+        assert_eq!(first.id, chat_id);
+        assert_eq!(first.payload.len(), 64 * 1024);
+        assert_eq!(second.id, CStartConfiguration::to_id(version));
+
+        from_client_w
+            .write_all(&client_frame[half..])
+            .await
+            .expect("write rest");
+        let packet = timeout(
+            Duration::from_secs(5),
+            next_client_packet(&mut client_packets),
+        )
+        .await
+        .expect("client packet")
+        .expect("whole client packet");
+        assert_eq!(packet.id, 0x10);
+        assert_eq!(packet.payload.len(), 100);
     }
 }
